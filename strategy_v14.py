@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from global_throttle import GlobalThrottle
+from v4_rules import reverse_sell_divisor
 
 class V14Strategy:
     def __init__(self, config):
@@ -186,39 +187,40 @@ class V14Strategy:
         split = self._safe_float(self.cfg.get_split_count(ticker))
         if split <= 0: split = 40.0
 
+        t_val, one_portion_amt, book_cash = self.cfg.calculate_v14_state(ticker)
+        t_val = self._safe_float(t_val)
+        one_portion_amt = self._safe_float(one_portion_amt)
+        book_cash = self._safe_float(book_cash)
+
         rev_state = self.cfg.get_reverse_state(ticker)
         is_rev_active = rev_state.get('is_active', False)
         
         if is_rev_active:
-            loss_pct = ((current_price - avg_price) / avg_price * 100.0) if avg_price > 0 else 0.0
-            escape_thresh = -15.0 if ticker == "TQQQ" else -20.0
+            ref_px = prev_close if prev_close > 0 else current_price
+            loss_pct = ((ref_px - avg_price) / avg_price * 100.0) if avg_price > 0 else 0.0
+            escape_thresh = -self._safe_float(self.cfg.get_target_profit(ticker))
+            rev_cash = self._safe_float(rev_state.get('rem_cash', 0.0))
+            share_px = ref_px if ref_px > 0 else current_price
+            can_rebuy = share_px > 0 and (rev_cash / 4.0) >= share_px
             
-            if loss_pct >= escape_thresh and qty > 0:
+            if loss_pct >= escape_thresh and qty > 0 and can_rebuy:
                 logging.info(f"🚀 [{ticker}] 손실률 {loss_pct:.2f}% 도달 (임계치 {escape_thresh}%). 리버스 모드 탈출 및 일반 모드 롤오버를 가동합니다.")
-                dynamic_t = self._safe_float(rev_state.get('dynamic_t', 0.0))
-                rem_cash = self._safe_float(rev_state.get('rem_cash', 0.0))
-                
-                safe_denom = max(1.0, split - dynamic_t)
-                new_portion = rem_cash / safe_denom if rem_cash > 0 else 1.0
-                new_seed = new_portion * split
-                
-                self.cfg.set_seed(ticker, new_seed)
+                dynamic_t = self._safe_float(rev_state.get('dynamic_t', t_val))
+                self.cfg.carry_v4_t(ticker, dynamic_t)
                 self.cfg.set_reverse_state(ticker, False, 0, 0.0, dynamic_t=0.0, rem_cash=0.0, is_day_one=True)
                 is_rev_active = False
+                t_val, one_portion_amt, book_cash = self.cfg.calculate_v14_state(ticker)
+                t_val = self._safe_float(t_val)
+                one_portion_amt = self._safe_float(one_portion_amt)
+                book_cash = self._safe_float(book_cash)
 
-        seed = self._safe_float(self.cfg.get_seed(ticker))
         target_pct_val = self._safe_float(self.cfg.get_target_profit(ticker))
         target_ratio = target_pct_val / 100.0
-        
-        portion = seed / split if split > 0 else 1.0
-        t_val = (qty * avg_price) / portion if portion > 0 else 0.0
         t_val = round(t_val, 4)
 
         target_price = self._ceil(avg_price * (1 + target_ratio)) if avg_price > 0 else 0.0
         
         is_jackpot_reached = target_price > 0 and current_price >= target_price
-        
-        one_portion_amt = portion
         
         depreciation_factor = 2.0 / split if split > 0 else 0.1
         star_ratio = target_ratio - (target_ratio * depreciation_factor * t_val)
@@ -243,7 +245,9 @@ class V14Strategy:
             if is_rev_active or t_val > (split - 1):
                 if not is_rev_active:
                     logging.info(f"🚨 [{ticker}] T값({t_val})이 {split-1}을 돌파하여 리버스 모드(소진 방어)로 강제 진입합니다.")
-                    self.cfg.set_reverse_state(ticker, True, 0, 0.0, dynamic_t=t_val, rem_cash=real_available_cash, is_day_one=True)
+                    entry_cash = book_cash if book_cash > 0 else real_available_cash
+                    self.cfg.carry_v4_t(ticker, t_val)
+                    self.cfg.set_reverse_state(ticker, True, 0, 0.0, dynamic_t=t_val, rem_cash=entry_cash, is_day_one=True)
                     is_rev_active = True
                 else:
                     # 🚨 NEW: 리버스 장부 정산(잔액 역산 및 T값 스케일링)을 스냅샷 모드에서 원자적 1회 호출
@@ -256,7 +260,7 @@ class V14Strategy:
                 rem_cash = self._safe_float(rev_state.get('rem_cash', 0.0))
                 is_day_one = rev_state.get('is_day_one', True)
                 
-                N_div = 10 if split <= 20 else 20
+                N_div = reverse_sell_divisor(split)
                 sell_qty = math.floor(qty / N_div)
                 
                 if is_day_one:

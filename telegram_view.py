@@ -354,7 +354,7 @@ class TelegramView:
                 icon, ver_display = "⚖️", "V_REV 역추세 (로컬 1분 VWAP)" 
             else:
                 icon = "💎"
-                ver_display = "무매4 (로컬 1분 VWAP)" if is_manual_vwap else "무매4 (LOC)" 
+                ver_display = "무매 V4 (로컬 1분 VWAP)" if is_manual_vwap else "무매 V4 (LOC)" 
                 
             split_cnt = int(self._safe_float(config.get_split_count(t)))
             target_profit = self._safe_float(config.get_target_profit(t))
@@ -463,7 +463,7 @@ class TelegramView:
                 main_icon = "⚖️"
                 bdg_txt = f"1회(1배수) 예산: ${safe_one_portion:,.0f}"
             else:
-                v_mode_display = "무매4 (로컬 1분 VWAP)" if is_manual_vwap else "무매4 (LOC)" 
+                v_mode_display = "무매 V4 (로컬 1분 VWAP)" if is_manual_vwap else "무매 V4 (LOC)" 
                 main_icon = "💎"
                 bdg_txt = f"당일 예산: ${safe_one_portion:,.0f}"
 

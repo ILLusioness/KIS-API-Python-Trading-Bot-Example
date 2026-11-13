@@ -132,7 +132,18 @@ class InfiniteStrategy:
         except Exception:
             is_vwap_enabled = False
         
-        if version == "V14" and is_vwap_enabled:
+        force_loc_reverse = False
+        if version == "V14":
+            try:
+                rev_state = self.cfg.get_reverse_state(safe_ticker) or {}
+                split_now = self._safe_float(self.cfg.get_split_count(safe_ticker))
+                t_now, _ = self.cfg.get_absolute_t_val(safe_ticker, qty, avg_price)
+                if rev_state.get("is_active") or (split_now > 0 and t_now > (split_now - 1)):
+                    force_loc_reverse = True
+            except Exception as rev_err:
+                logging.error(f"🚨 [{safe_ticker}] V4 리버스 라우팅 확인 실패: {rev_err}")
+
+        if version == "V14" and is_vwap_enabled and not force_loc_reverse:
             plan = self.v14_vwap_plugin.get_plan(
                 ticker=safe_ticker, current_price=current_price, avg_price=avg_price, qty=qty,
                 prev_close=prev_close, ma_5day=ma_5day, market_type=market_type,
