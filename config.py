@@ -74,12 +74,13 @@ class ConfigManager:
             "AVWAP_GAP_THRESH_CFG": "data/avwap_gap_thresh.json",
             "AVWAP_ANCHOR_CFG": "data/avwap_anchor.json",
             "AVWAP_BUDGET_CFG": "data/avwap_budget.json",         
-            "AVWAP_OVERNIGHT_CFG": "data/avwap_overnight.json"      
+            "AVWAP_OVERNIGHT_CFG": "data/avwap_overnight.json",
+            "V4_STATE": "data/v4_state.json",
         }
         
         self.DEFAULT_SEED = {"SOXL": 6720.0, "TQQQ": 6720.0}
         self.DEFAULT_SPLIT = {"SOXL": 40.0, "TQQQ": 40.0}
-        self.DEFAULT_TARGET = {"SOXL": 12.0, "TQQQ": 10.0}
+        self.DEFAULT_TARGET = {"SOXL": 20.0, "TQQQ": 15.0}
         self.DEFAULT_VERSION = {"SOXL": "V14", "TQQQ": "V14"}
         self.DEFAULT_COMPOUND = {"SOXL": 70.0, "TQQQ": 70.0}
         self.DEFAULT_SNIPER_MULTIPLIER = {"SOXL": 1.0, "TQQQ": 0.9}
@@ -288,18 +289,7 @@ class ConfigManager:
             return bool(locks.get(f"{today}_{ticker}_{market_type}", False))
 
     def get_absolute_t_val(self, ticker, actual_qty, actual_avg_price):
-        rev_state = self.get_reverse_state(ticker)
-        split = self.get_split_count(ticker)
-        
-        if rev_state.get("is_active", False):
-            dynamic_t = self._safe_float(rev_state.get("dynamic_t", 0.0))
-            rem_cash = self._safe_float(rev_state.get("rem_cash", 0.0))
-            one_portion = rem_cash / 4.0 if rem_cash > 0 else 0.0
-            return round(dynamic_t, 4), round(one_portion, 2)
-            
-        seed = self.get_seed(ticker)
-        one_portion = seed / split if split > 0 else 1.0
-        t_val = (self._safe_float(actual_qty) * self._safe_float(actual_avg_price)) / one_portion if one_portion > 0 else 0.0
+        t_val, one_portion, _ = self.calculate_v14_state(ticker)
         return round(t_val, 4), round(one_portion, 2)
 
     def apply_stock_split(self, ticker, ratio):
@@ -470,6 +460,7 @@ class ConfigManager:
             remaining = [r for r in ledger if r.get('ticker') != ticker]
             self._save_json(self.FILES["LEDGER"], remaining)
             self.set_reverse_state(ticker, False, 0, 0.0, dynamic_t=0.0, rem_cash=0.0, is_day_one=True)
+            self.reset_v4_cycle(ticker)
 
     def calculate_holdings(self, ticker, records=None):
         if records is None:
@@ -601,15 +592,9 @@ class ConfigManager:
                     had_sell = True
 
             if had_buy or had_sell:
-                # 🚨 MODIFIED: KIS 예수금 의존 파기 및 순수 장부 역산으로 자본 격리 완벽 사수
+                from v4_rules import apply_reverse_day
                 rem_cash = max(0.0, rem_cash + sell_sum - buy_sum)
-
-                if had_sell:
-                    if split <= 20: dynamic_t *= 0.9
-                    else: dynamic_t *= 0.95
-                
-                if had_buy:
-                    dynamic_t += (split - dynamic_t) * 0.25
+                dynamic_t = apply_reverse_day(dynamic_t, split, had_sell, had_buy)
 
                 logging.info(f"♻️ [{ticker}] 리버스 일일 정산 완료: sell=${sell_sum:.2f}, buy=${buy_sum:.2f} ➔ 잔액=${rem_cash:.2f}, T값={dynamic_t:.4f}")
 
@@ -619,6 +604,7 @@ class ConfigManager:
             
             d[ticker] = state
             self._save_json(self.FILES["REVERSE_CFG"], d)
+            self.carry_v4_t(ticker, dynamic_t)
 
     def increment_reverse_day(self, ticker):
         with GlobalThrottle.get_file_lock(self.FILES["REVERSE_CFG"]):
@@ -641,62 +627,166 @@ class ConfigManager:
                     return True
         return False
 
+    def _ticker_ledger(self, ticker):
+        ledger = self.get_ledger()
+        rows = [r for r in ledger if isinstance(r, dict) and r.get('ticker') == ticker]
+        rows.sort(key=lambda r: int(self._safe_float(r.get('id', 0))))
+        return rows
+
+    def _cash_from_records(self, records, seed):
+        holdings = 0
+        rem_cash = self._safe_float(seed)
+        total_invested = 0.0
+        for r in records or []:
+            if holdings == 0:
+                rem_cash = self._safe_float(seed)
+                total_invested = 0.0
+            qty = int(self._safe_float(r.get('qty', 0)))
+            price = self._safe_float(r.get('price', 0.0))
+            amt = qty * price
+            if r.get('side') == 'BUY':
+                rem_cash -= amt
+                holdings += qty
+                total_invested += amt
+            elif r.get('side') == 'SELL':
+                if qty >= holdings:
+                    holdings = 0
+                    rem_cash = self._safe_float(seed)
+                    total_invested = 0.0
+                else:
+                    if holdings > 0:
+                        avg_price = total_invested / holdings
+                        total_invested -= (qty * avg_price)
+                    holdings -= qty
+                    rem_cash += amt
+        avg_price = total_invested / holdings if holdings > 0 else 0.0
+        return holdings, max(0.0, rem_cash), avg_price
+
+    def _read_v4_state(self, ticker):
+        with GlobalThrottle.get_file_lock(self.FILES["V4_STATE"]):
+            data = self._load_json(self.FILES["V4_STATE"], {})
+            raw = data.get(ticker) if isinstance(data, dict) else None
+            if not isinstance(raw, dict):
+                return {"t": 0.0, "initialized": False, "last_ledger_id": 0}
+            return {
+                "t": self._safe_float(raw.get("t", 0.0)),
+                "initialized": bool(raw.get("initialized", False)),
+                "last_ledger_id": int(self._safe_float(raw.get("last_ledger_id", 0))),
+            }
+
+    def _save_v4_state(self, ticker, state):
+        with GlobalThrottle.get_file_lock(self.FILES["V4_STATE"]):
+            data = self._load_json(self.FILES["V4_STATE"], {})
+            if not isinstance(data, dict):
+                data = {}
+            data[ticker] = {
+                "t": round(self._safe_float(state.get("t", 0.0)), 6),
+                "initialized": bool(state.get("initialized", False)),
+                "last_ledger_id": int(self._safe_float(state.get("last_ledger_id", 0))),
+            }
+            self._save_json(self.FILES["V4_STATE"], data)
+
+    def carry_v4_t(self, ticker, t_val):
+        state = self._read_v4_state(ticker)
+        if not state.get("initialized"):
+            rows = self._ticker_ledger(ticker)
+            last_id = max([int(self._safe_float(r.get("id", 0))) for r in rows] + [0])
+            state["initialized"] = True
+            state["last_ledger_id"] = last_id
+        state["t"] = self._safe_float(t_val)
+        self._save_v4_state(ticker, state)
+
+    def reset_v4_cycle(self, ticker):
+        self._save_v4_state(ticker, {"t": 0.0, "initialized": True, "last_ledger_id": 0})
+
+    def _settle_v4_normal(self, ticker):
+        from v4_rules import apply_normal_day, legacy_progress_t, one_buy_amount
+
+        rows = self._ticker_ledger(ticker)
+        state = self._read_v4_state(ticker)
+        split = self.get_split_count(ticker)
+        if split <= 0:
+            split = 40.0
+        seed = self.get_seed(ticker)
+        max_id = max([int(self._safe_float(r.get("id", 0))) for r in rows] + [0])
+
+        if not state.get("initialized"):
+            holdings, _, avg_price = self._cash_from_records(rows, seed)
+            state = {
+                "t": round(legacy_progress_t(holdings, avg_price, seed, split), 6),
+                "initialized": True,
+                "last_ledger_id": max_id,
+            }
+            self._save_v4_state(ticker, state)
+            return
+
+        last_id = int(state.get("last_ledger_id", 0))
+        fresh = [
+            r for r in rows
+            if int(self._safe_float(r.get("id", 0))) > last_id and not r.get("is_reverse", False)
+        ]
+        if not fresh:
+            return
+
+        fresh_ids = {int(self._safe_float(r.get("id", 0))) for r in fresh}
+        base = [r for r in rows if int(self._safe_float(r.get("id", 0))) not in fresh_ids]
+        t_val = self._safe_float(state.get("t", 0.0))
+        groups = []
+        for rec in fresh:
+            day = str(rec.get("date", ""))[:10]
+            if not groups or groups[-1][0] != day:
+                groups.append((day, []))
+            groups[-1][1].append(rec)
+
+        for _, day_rows in groups:
+            holdings, rem_cash, _ = self._cash_from_records(base, seed)
+            portion = (seed / split) if holdings <= 0 else one_buy_amount(rem_cash, split, t_val)
+            buy_amount = 0.0
+            sell_qty = 0
+            for rec in day_rows:
+                qty = int(self._safe_float(rec.get("qty", 0)))
+                price = self._safe_float(rec.get("price", 0.0))
+                if rec.get("side") == "BUY":
+                    buy_amount += qty * price
+                elif rec.get("side") == "SELL":
+                    sell_qty += qty
+            t_val = apply_normal_day(t_val, portion, holdings, buy_amount, sell_qty)
+            base.extend(day_rows)
+            if self._cash_from_records(base, seed)[0] <= 0:
+                t_val = 0.0
+
+        state["t"] = round(t_val, 6)
+        state["last_ledger_id"] = max_id
+        state["initialized"] = True
+        self._save_v4_state(ticker, state)
+
     def calculate_v14_state(self, ticker):
+        from v4_rules import one_buy_amount
+
         rev_state = self.get_reverse_state(ticker)
         split = self.get_split_count(ticker)
-        
+        if split <= 0:
+            split = 40.0
+
         if rev_state.get("is_active", False):
             dynamic_t = self._safe_float(rev_state.get("dynamic_t", 0.0))
             rem_cash = self._safe_float(rev_state.get("rem_cash", 0.0))
             current_budget = rem_cash / 4.0 if rem_cash > 0 else 0.0
             return max(0.0, round(dynamic_t, 4)), max(0.0, current_budget), max(0.0, rem_cash)
-            
-        ledger = self.get_ledger()
-        target_recs = sorted([r for r in ledger if isinstance(r, dict) and r.get('ticker') == ticker], key=lambda x: int(self._safe_float(x.get('id', 0))))
-        
+
+        self._settle_v4_normal(ticker)
+        state = self._read_v4_state(ticker)
+        t_val = self._safe_float(state.get("t", 0.0))
         seed = self.get_seed(ticker)
-        base_portion = seed / split if split > 0 else 1.0
-        
-        holdings = 0
-        rem_cash = seed
-        total_invested = 0.0
-        
-        for r in target_recs:
-            if holdings == 0:
-                rem_cash = seed
-                total_invested = 0.0
-        
-            qty = int(self._safe_float(r.get('qty', 0)))
-            price = self._safe_float(r.get('price', 0.0))
-            amt = qty * price
-            
-            if r.get('side') == 'BUY':
-                rem_cash -= amt
-                holdings += qty
-                total_invested += amt
-                
-            elif r.get('side') == 'SELL':
-                if qty >= holdings: 
-                    holdings = 0
-                    rem_cash = seed
-                    total_invested = 0.0
-                else: 
-                    if holdings > 0:
-                        avg_price = total_invested / holdings
-                        total_invested -= (qty * avg_price)
-                holdings -= qty
-                rem_cash += amt
-             
-        avg_price = total_invested / holdings if holdings > 0 else 0.0
-        t_val = (holdings * avg_price) / base_portion if base_portion > 0 else 0.0
-        
-        if holdings > 0:
-            safe_denom = max(1.0, split - t_val)
-            current_budget = rem_cash / safe_denom
-        else:
-            current_budget = base_portion
-            t_val = 0.0
-             
+        holdings, rem_cash, _ = self._cash_from_records(self._ticker_ledger(ticker), seed)
+
+        if holdings <= 0:
+            if t_val != 0.0:
+                self.carry_v4_t(ticker, 0.0)
+            base_portion = seed / split if split > 0 else 0.0
+            return 0.0, max(0.0, base_portion), max(0.0, seed)
+
+        current_budget = one_buy_amount(rem_cash, split, t_val)
         return max(0.0, round(t_val, 4)), max(0.0, current_budget), max(0.0, rem_cash)
 
     def archive_graduation(self, ticker, end_date, prev_close=0.0):
@@ -716,7 +806,8 @@ class ConfigManager:
                 is_reverse = self.get_reverse_state(ticker).get("is_active", False)
 
                 if is_reverse:
-                    divisor = 10 if split <= 20 else 20
+                    from v4_rules import reverse_sell_divisor
+                    divisor = reverse_sell_divisor(split)
                     loc_qty = math.floor(ledger_qty / divisor)
                 else:
                     loc_qty = math.ceil(ledger_qty / 4)
@@ -847,8 +938,10 @@ class ConfigManager:
             return self._safe_float(self._load_json(self.FILES["SPLIT"], self.DEFAULT_SPLIT).get(t, 40.0))
          
     def get_target_profit(self, t): 
+        from v4_rules import official_target_percent
         with GlobalThrottle.get_file_lock(self.FILES["PROFIT_CFG"]):
-            return self._safe_float(self._load_json(self.FILES["PROFIT_CFG"], self.DEFAULT_TARGET).get(t, 10.0))
+            configured = self._safe_float(self._load_json(self.FILES["PROFIT_CFG"], self.DEFAULT_TARGET).get(t, 10.0))
+        return official_target_percent(t, configured)
         
     def get_fee(self, t): 
         with GlobalThrottle.get_file_lock(self.FILES["FEE_CFG"]):
